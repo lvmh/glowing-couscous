@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type React from "react";
-import type { AudioAnalysis } from "@/lib/audio-engine";
+import type { AudioAnalysis, ScaleMode } from "@/lib/audio-engine";
 import { audioBufferToWav, generateOutputFilename, NOTE_NAMES } from "@/lib/audio-engine";
 import { WaveformDisplay } from "./waveform-display";
 
@@ -47,17 +47,29 @@ export function AnalysisResults({ analysis, stopRef }: AnalysisResultsProps) {
 
   // ── key override ─────────────────────────────────────────────────────────────
   const [userKeyIndex, setUserKeyIndex] = useState<number | null>(null);
-  const [userMode, setUserMode]         = useState<"Major" | "Minor" | null>(null);
+  const [userMode, setUserMode]         = useState<ScaleMode | null>(null);
 
   useEffect(() => { setUserKeyIndex(null); setUserMode(null); }, [analysis]);
 
-  const relativeKeyIndex  = analysis.mode === "Major" ? (analysis.keyIndex + 9) % 12 : (analysis.keyIndex + 3) % 12;
-  const relativeMode: "Major" | "Minor" = analysis.mode === "Major" ? "Minor" : "Major";
-  const relativeKeyName   = NOTE_NAMES[relativeKeyIndex];
+  const isMajMin = analysis.mode === "Major" || analysis.mode === "Minor";
+  // For Major/Minor: show the relative key (classic music theory toggle).
+  // For other modes: show the parallel minor (same root) as the primary alt,
+  // and parallel major as a second option.
+  const alt1Idx: number = isMajMin
+    ? (analysis.mode === "Major" ? (analysis.keyIndex + 9) % 12 : (analysis.keyIndex + 3) % 12)
+    : analysis.keyIndex;
+  const alt1Mode: ScaleMode = isMajMin
+    ? (analysis.mode === "Major" ? "Minor" : "Major")
+    : "Minor";
+  const alt1Name        = NOTE_NAMES[alt1Idx];
+  const isUsingDetected = userKeyIndex === null;
+  const isUsingAlt1     = userKeyIndex === alt1Idx && userMode === alt1Mode;
+  const isUsingParallelMajor = !isMajMin && userKeyIndex === analysis.keyIndex && userMode === "Major";
+  const toggleLabel     = isMajMin ? "~relative~" : "~parallel~";
+
   const effectiveKeyIndex = userKeyIndex ?? analysis.keyIndex;
   const effectiveMode     = userMode ?? analysis.mode;
   const effectiveKey      = NOTE_NAMES[effectiveKeyIndex];
-  const isUsingRelative   = userKeyIndex === relativeKeyIndex && userMode === relativeMode;
 
   const outputFilename = generateOutputFilename(
     analysis.originalName, analysis.bpm, effectiveKey, effectiveMode
@@ -252,35 +264,63 @@ export function AnalysisResults({ analysis, stopRef }: AnalysisResultsProps) {
         <Rule label="key" />
         <div className="flex items-center gap-2 text-xs pl-1 flex-wrap">
           <span className="text-primary/60">❯</span>
+
+          {/* detected / current */}
           <button
             type="button"
             onClick={() => { setUserKeyIndex(null); setUserMode(null); }}
             className={`transition-colors px-1.5 py-0.5 rounded ${
-              !isUsingRelative
+              isUsingDetected
                 ? "text-primary bg-primary/10"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {!isUsingRelative && <span className="mr-1 text-[10px]">✦</span>}
+            {isUsingDetected && <span className="mr-1 text-[10px]">✦</span>}
             [{analysis.key} {analysis.mode}]
           </button>
+
           <span className="text-muted-foreground/40">↔</span>
+
+          {/* alt1: relative (maj/min) or parallel minor (modes) */}
           <button
             type="button"
             onClick={() => {
-              if (isUsingRelative) { setUserKeyIndex(null); setUserMode(null); }
-              else { setUserKeyIndex(relativeKeyIndex); setUserMode(relativeMode); }
+              if (isUsingAlt1) { setUserKeyIndex(null); setUserMode(null); }
+              else { setUserKeyIndex(alt1Idx); setUserMode(alt1Mode); }
             }}
             className={`transition-colors px-1.5 py-0.5 rounded ${
-              isUsingRelative
+              isUsingAlt1
                 ? "text-primary bg-primary/10"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
-            {isUsingRelative && <span className="mr-1 text-[10px]">✦</span>}
-            [{relativeKeyName} {relativeMode}]
+            {isUsingAlt1 && <span className="mr-1 text-[10px]">✦</span>}
+            [{alt1Name} {alt1Mode}]
           </button>
-          <span className="ml-auto text-[10px] text-muted-foreground/40 italic">~relative~</span>
+
+          {/* alt2: parallel major — only for non-Major/Minor modes */}
+          {!isMajMin && (
+            <>
+              <span className="text-muted-foreground/40">↔</span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (isUsingParallelMajor) { setUserKeyIndex(null); setUserMode(null); }
+                  else { setUserKeyIndex(analysis.keyIndex); setUserMode("Major"); }
+                }}
+                className={`transition-colors px-1.5 py-0.5 rounded ${
+                  isUsingParallelMajor
+                    ? "text-primary bg-primary/10"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {isUsingParallelMajor && <span className="mr-1 text-[10px]">✦</span>}
+                [{analysis.key} Major]
+              </button>
+            </>
+          )}
+
+          <span className="ml-auto text-[10px] text-muted-foreground/40 italic">{toggleLabel}</span>
         </div>
       </div>
 
@@ -353,7 +393,7 @@ function Row({
   return (
     <div className="flex items-baseline gap-3 text-xs">
       <span className="text-muted-foreground/60 w-4 shrink-0">{icon}</span>
-      <span className="text-muted-foreground w-14 shrink-0">{label}</span>
+      <span className="text-muted-foreground w-20 shrink-0">{label}</span>
       <span className={accent ? "text-primary font-bold text-sm" : "text-foreground"}>{value}</span>
     </div>
   );

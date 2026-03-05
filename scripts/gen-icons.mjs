@@ -1,4 +1,17 @@
-<?xml version="1.0" encoding="UTF-8"?>
+// Generates favicon PNGs from the recolored hotelsoap SVG using sharp.
+// Run with: node scripts/gen-icons.mjs
+
+import sharp from "sharp";
+import { writeFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const publicDir = join(__dirname, "../public");
+const appDir    = join(__dirname, "../app");
+
+// Recolored SVG: #e48cff → #6BBF23 (kawasaki green), #31617c → #1a3d06 (dark green)
+const svg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg width="512" height="512" version="1.1" viewBox="0 0 51.083 49.372" xmlns="http://www.w3.org/2000/svg">
  <defs>
   <clipPath id="clipPath1101">
@@ -21,4 +34,28 @@
    </g>
   </g>
  </g>
-</svg>
+</svg>`;
+
+const svgBuf = Buffer.from(svg);
+
+// Write the SVG to public/ and app/ (Next.js App Router auto-uses app/icon.svg)
+writeFileSync(join(publicDir, "icon.svg"), svg);
+writeFileSync(join(appDir, "icon.svg"), svg);
+console.log("✦ wrote icon.svg");
+
+// Generate PNGs
+const sizes = [
+  { size: 32,  out: join(publicDir, "icon-32x32.png") },
+  { size: 180, out: join(publicDir, "apple-icon.png") },
+  { size: 192, out: join(publicDir, "icon-192.png") },
+];
+
+for (const { size, out } of sizes) {
+  await sharp(svgBuf, { density: Math.round(size * 3.78) })
+    .resize(size, size)
+    .png()
+    .toFile(out);
+  console.log(`✦ wrote ${size}x${size} → ${out.split("/").pop()}`);
+}
+
+console.log("✧ done");

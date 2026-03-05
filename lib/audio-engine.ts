@@ -8,6 +8,27 @@ const KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.
 const TEMP_MAJOR = [5.0, 2.0, 3.5, 2.0, 4.5, 4.0, 2.0, 4.5, 2.0, 3.5, 1.5, 4.0];
 const TEMP_MINOR = [5.0, 2.0, 3.5, 4.5, 2.0, 4.0, 2.0, 4.5, 3.5, 2.0, 3.5, 1.5];
 
+// Mode profiles — 12 chroma weights relative to root (index 0).
+// Non-diatonic notes get 0.80; characteristic color tones are boosted
+// so adjacent modes can be distinguished when that degree is prominent.
+//   index: 0=root 1=b2 2=2 3=b3 4=3 5=4 6=#4/b5 7=5 8=b6 9=6 10=b7 11=7
+const DORIAN_PROFILE         = [6.35, 0.80, 3.00, 4.00, 0.80, 3.80, 0.80, 5.19, 0.80, 3.80, 3.40, 0.80];
+const PHRYGIAN_PROFILE       = [6.35, 3.20, 0.80, 4.00, 0.80, 3.80, 0.80, 5.19, 2.80, 0.80, 3.40, 0.80];
+const LYDIAN_PROFILE         = [6.35, 0.80, 3.00, 0.80, 4.38, 0.80, 3.50, 5.19, 0.80, 3.60, 0.80, 2.80];
+const MIXOLYDIAN_PROFILE     = [6.35, 0.80, 3.00, 0.80, 4.38, 3.80, 0.80, 5.19, 0.80, 3.60, 3.60, 0.80];
+const HARMONIC_MINOR_PROFILE = [6.35, 0.80, 3.00, 4.00, 0.80, 3.80, 0.80, 5.19, 2.80, 0.80, 0.80, 4.20];
+const MELODIC_MINOR_PROFILE  = [6.35, 0.80, 3.00, 4.00, 0.80, 3.80, 0.80, 5.19, 0.80, 3.60, 0.80, 3.20];
+
+export type ScaleMode =
+  | "Major"
+  | "Minor"
+  | "Dorian"
+  | "Phrygian"
+  | "Lydian"
+  | "Mixolydian"
+  | "Harmonic Minor"
+  | "Melodic Minor";
+
 export const NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
 
 export interface AudioAnalysis {
@@ -17,7 +38,7 @@ export interface AudioAnalysis {
   bpmSource: "filename" | "detected";
   key: string;
   keyIndex: number;       // 0 = C, 1 = Db, … 11 = B
-  mode: "Major" | "Minor";
+  mode: ScaleMode;
   keyDisplay: string;
   originalName: string;
   trimmedBuffer: AudioBuffer;
@@ -243,7 +264,7 @@ export function detectBPM(audioBuffer: AudioBuffer): number {
  * Lower octaves (2-3) are weighted more heavily because bass and rhythm
  * instruments carry the strongest tonal anchors in production music.
  */
-export function detectKey(audioBuffer: AudioBuffer): { key: string; keyIndex: number; mode: "Major" | "Minor" } {
+export function detectKey(audioBuffer: AudioBuffer): { key: string; keyIndex: number; mode: ScaleMode } {
   const sampleRate = audioBuffer.sampleRate;
   const channelData = audioBuffer.getChannelData(0);
 
@@ -298,33 +319,53 @@ export function detectKey(audioBuffer: AudioBuffer): { key: string; keyIndex: nu
   const chromaArr = Array.from(chroma);
 
   // Score each of the 24 keys using the average of KS and Temperley correlations
-  let bestKey = 0;
-  let bestMode: "Major" | "Minor" = "Major";
-  let bestScore = -Infinity;
+  // How much a modal profile must beat the best Major/Minor score to be reported.
+  // Keeps Major/Minor as the default for ambiguous tracks.
+  const MODAL_THRESHOLD = 0.12;
+
+  // ── Pass 1: find best Major / Minor across all roots ────────────────────────
+  let bestMajMinScore = -Infinity;
+  let bestMajMinKey   = 0;
+  let bestMajMinMode: ScaleMode = "Major";
 
   for (let key = 0; key < 12; key++) {
     const majorScore =
       0.5 * pearsonCorrelation(chromaArr, rotateArray(KS_MAJOR, key)) +
       0.5 * pearsonCorrelation(chromaArr, rotateArray(TEMP_MAJOR, key));
-
-    if (majorScore > bestScore) {
-      bestScore = majorScore;
-      bestKey = key;
-      bestMode = "Major";
-    }
-
     const minorScore =
       0.5 * pearsonCorrelation(chromaArr, rotateArray(KS_MINOR, key)) +
       0.5 * pearsonCorrelation(chromaArr, rotateArray(TEMP_MINOR, key));
 
-    if (minorScore > bestScore) {
-      bestScore = minorScore;
-      bestKey = key;
-      bestMode = "Minor";
+    if (majorScore > bestMajMinScore) { bestMajMinScore = majorScore; bestMajMinKey = key; bestMajMinMode = "Major"; }
+    if (minorScore > bestMajMinScore) { bestMajMinScore = minorScore; bestMajMinKey = key; bestMajMinMode = "Minor"; }
+  }
+
+  // ── Pass 2: find best modal profile across all roots ────────────────────────
+  const modalProfiles: [number[], ScaleMode][] = [
+    [DORIAN_PROFILE,         "Dorian"],
+    [PHRYGIAN_PROFILE,       "Phrygian"],
+    [LYDIAN_PROFILE,         "Lydian"],
+    [MIXOLYDIAN_PROFILE,     "Mixolydian"],
+    [HARMONIC_MINOR_PROFILE, "Harmonic Minor"],
+    [MELODIC_MINOR_PROFILE,  "Melodic Minor"],
+  ];
+
+  let bestModalScore = -Infinity;
+  let bestModalKey   = 0;
+  let bestModalMode: ScaleMode = "Dorian";
+
+  for (let key = 0; key < 12; key++) {
+    for (const [profile, mode] of modalProfiles) {
+      const score = pearsonCorrelation(chromaArr, rotateArray(profile, key));
+      if (score > bestModalScore) { bestModalScore = score; bestModalKey = key; bestModalMode = mode; }
     }
   }
 
-  return { key: NOTE_NAMES[bestKey], keyIndex: bestKey, mode: bestMode };
+  // Only report a modal result when it clearly outperforms Major/Minor.
+  if (bestModalScore > bestMajMinScore + MODAL_THRESHOLD) {
+    return { key: NOTE_NAMES[bestModalKey], keyIndex: bestModalKey, mode: bestModalMode };
+  }
+  return { key: NOTE_NAMES[bestMajMinKey], keyIndex: bestMajMinKey, mode: bestMajMinMode };
 }
 
 function pearsonCorrelation(x: number[], y: number[]): number {
@@ -576,7 +617,7 @@ export function generateOutputFilename(
   originalName: string,
   bpm: number,
   key: string,
-  mode: "Major" | "Minor"
+  mode: ScaleMode
 ): string {
   // Remove extension from original name
   const baseName = originalName.replace(/\.[^/.]+$/, "");
