@@ -255,92 +255,400 @@ export function detectBPM(audioBuffer: AudioBuffer): number {
   return bpm;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Key detection — pro-grade pipeline
+//
+// Stage 1  Global tuning estimation    corrects ±30-cent detuning before
+//                                       mapping frequencies to pitch classes
+// Stage 2  Sliding-window analysis     5 s windows, 2.5 s hop, so drops and
+//                                       choruses each get their own vote
+// Stage 3  Per-window chromagram       FFT chroma (bass-biased octave weights)
+//           (dual chroma)              + HPCP (spectral-peak harmonic expansion)
+//                                       Both use the tuning-corrected pitch grid
+// Stage 4  Spectral flatness gating    frames with low tonal content (noisy /
+//           (simplified HPS)           percussive) are down-weighted before
+//                                       contributing to the chromagram
+// Stage 5  Four-method ensemble        per window, 24 key candidates scored:
+//           A  KS + Temperley on FFT   Krumhansl–Schmuckler + Temperley
+//           B  KS + Temperley on HPCP  profile correlation (Pearson)
+//           C  Tonnetz on FFT          tonal-centroid Euclidean distance
+//           D  Tonnetz on HPCP         (Harte et al., 2006)
+// Stage 6  Energy-weighted histogram   each window's vote is weighted by its
+//                                       RMS energy^1.5 — drops / choruses win
+// Stage 7  Circle-of-fifths smoothing  stabilises the aggregate: adjacent keys
+//                                       on the CoF share a small probability
+//                                       mass, preventing implausible jumps
+// Stage 8  Modal check                 upgrades to a church mode only when the
+//                                       evidence clearly exceeds Major/Minor
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Stage 1: Global tuning estimation ────────────────────────────────────────
 /**
- * Detect musical key using a chromagram with octave-weighted Goertzel DFT,
- * scored against both Krumhansl-Schmuckler and Temperley key profiles.
- *
- * Combining two independent profile families (KS: perceptual study; Temperley:
- * corpus analysis) reduces false positives compared to either alone.
- * Lower octaves (2-3) are weighted more heavily because bass and rhythm
- * instruments carry the strongest tonal anchors in production music.
+ * Estimate how many semitones the track deviates from A=440 Hz (e.g. +0.15
+ * means 15 cents sharp).  Detects spectral peaks in the first 10 s, computes
+ * each peak's fractional deviation from the nearest equal-tempered pitch, and
+ * returns the median — robust to outlier peaks from percussion.
  */
-export function detectKey(audioBuffer: AudioBuffer): { key: string; keyIndex: number; mode: ScaleMode } {
-  const sampleRate = audioBuffer.sampleRate;
-  const channelData = audioBuffer.getChannelData(0);
+function estimateTuning(channelData: Float32Array, sampleRate: number, frameSize: number): number {
+  const HALF    = frameSize >> 1;
+  const hann    = new Float64Array(frameSize);
+  for (let i = 0; i < frameSize; i++) hann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (frameSize - 1)));
 
-  // Use up to 60 s for analysis (full track or middle section for very long files)
-  const analysisDuration = Math.min(60, audioBuffer.duration);
-  const startSample = Math.floor(((audioBuffer.duration - analysisDuration) / 2) * sampleRate);
-  const endSample = Math.min(startSample + Math.floor(analysisDuration * sampleRate), channelData.length);
-  const segment = channelData.slice(startSample, endSample);
+  const re  = new Float64Array(frameSize);
+  const im  = new Float64Array(frameSize);
+  const deviations: number[] = [];
+  const maxSamples = Math.min(channelData.length, sampleRate * 10);
+  const hop = frameSize >> 1;
 
-  // Octave weights: lower octaves carry more tonal information in production music
-  const octaveWeights: Record<number, number> = { 2: 1.5, 3: 1.5, 4: 1.2, 5: 1.0, 6: 0.7 };
+  for (let start = 0; start + frameSize <= maxSamples; start += hop) {
+    for (let i = 0; i < frameSize; i++) { re[i] = channelData[start + i] * hann[i]; im[i] = 0; }
+    fftInPlace(re, im);
 
-  const chroma = new Float64Array(12);
-  const A4 = 440;
-  const blockSize = Math.min(segment.length, Math.floor(sampleRate * 0.5)); // 500 ms blocks
+    let maxMag = 0;
+    const mag = new Float32Array(HALF);
+    for (let b = 1; b < HALF; b++) {
+      mag[b] = Math.sqrt(re[b] * re[b] + im[b] * im[b]);
+      if (mag[b] > maxMag) maxMag = mag[b];
+    }
+    if (maxMag === 0) continue;
+    const thresh = maxMag * 0.1;
 
-  for (let pitchClass = 0; pitchClass < 12; pitchClass++) {
-    let totalEnergy = 0;
+    for (let b = 2; b < HALF - 1; b++) {
+      const freq = b * sampleRate / frameSize;
+      if (freq < 200 || freq > 4000) continue; // mid-range only, avoids bass pitch ambiguity
+      if (mag[b] <= thresh || mag[b] < mag[b - 1] || mag[b] < mag[b + 1]) continue;
+      // Parabolic sub-bin refinement
+      const α = mag[b - 1], β = mag[b], γ = mag[b + 1];
+      const δ = 0.5 * (α - γ) / (α - 2 * β + γ + 1e-10);
+      const refinedFreq = (b + δ) * sampleRate / frameSize;
+      const midiFloat   = 69 + 12 * Math.log2(refinedFreq / 440);
+      deviations.push(midiFloat - Math.round(midiFloat)); // range [−0.5, +0.5]
+    }
+  }
+  if (deviations.length === 0) return 0;
+  deviations.sort((a, b) => a - b);
+  return deviations[Math.floor(deviations.length / 2)]; // median
+}
 
-    for (let octave = 2; octave <= 6; octave++) {
-      const midiNote = pitchClass + (octave + 1) * 12;
-      const freq = A4 * Math.pow(2, (midiNote - 69) / 12);
-      if (freq > sampleRate / 2) continue;
+// ── Stages 3, 4, 6: Energy-weighted chromagram with flatness gating ──────────
+/**
+ * Build FFT chroma and HPCP over the analysis region.
+ *
+ * Each FFT frame's contribution is scaled by two weights:
+ *
+ *   tonalWeight  — spectral flatness gate (1 = fully tonal, 0 = noisy/percussive).
+ *                  Suppresses drum hits, broadband noise, and breakdowns.
+ *                  Acts as a simplified harmonic–percussive separation.
+ *
+ *   energyWeight — frame RMS (linear, not squared), so high-energy sections
+ *                  (drops, choruses) contribute proportionally more without
+ *                  over-amplifying any single loud window.
+ *
+ * Returns both chromagrams normalised to [0, 1] plus the mean weighted energy
+ * (used by the caller for optional per-section debugging).
+ */
+function buildChromagrams(
+  channelData:  Float32Array,
+  sampleRate:   number,
+  startSample:  number,
+  endSample:    number,
+  tuningOffset: number,
+  prealloc: {
+    re: Float64Array; im: Float64Array; mag: Float32Array;
+    binPc: Int8Array; binOct: Int8Array; hann: Float64Array;
+    FRAME: number;
+  }
+): { fftChroma: number[]; hpcpChroma: number[] } {
+  const { re, im, mag, binPc, binOct, hann, FRAME } = prealloc;
+  const HOP  = FRAME >> 1;
+  const HALF = FRAME >> 1;
 
-      // Goertzel algorithm — efficient single-frequency DFT
-      const k = Math.round((freq * segment.length) / sampleRate);
-      const w = (2 * Math.PI * k) / segment.length;
-      const coeff = 2 * Math.cos(w);
-      let octaveEnergy = 0;
+  const fftAcc  = new Float64Array(12);
+  const hpcpAcc = new Float64Array(12);
+  let weightSum = 0;
+  const N_HARM = 8, SIGMA2 = 1.0;
 
-      for (let blockStart = 0; blockStart < segment.length; blockStart += blockSize) {
-        let s0 = 0, s1 = 0, s2 = 0;
-        const blockEnd = Math.min(blockStart + blockSize, segment.length);
-        for (let i = blockStart; i < blockEnd; i++) {
-          s0 = segment[i] + coeff * s1 - s2;
-          s2 = s1;
-          s1 = s0;
-        }
-        octaveEnergy += Math.abs(s1 * s1 + s2 * s2 - coeff * s1 * s2);
-      }
+  for (let fs = startSample; fs + FRAME <= endSample; fs += HOP) {
+    for (let i = 0; i < FRAME; i++) { re[i] = channelData[fs + i] * hann[i]; im[i] = 0; }
+    fftInPlace(re, im);
 
-      totalEnergy += octaveEnergy * (octaveWeights[octave] ?? 1.0);
+    let maxMag = 0, sumEnergy = 0;
+    for (let b = 1; b < HALF; b++) {
+      mag[b] = Math.sqrt(re[b] * re[b] + im[b] * im[b]);
+      if (mag[b] > maxMag) maxMag = mag[b];
+      sumEnergy += re[b] * re[b] + im[b] * im[b];
+    }
+    if (maxMag === 0) continue;
+    const frameRMS = Math.sqrt(sumEnergy / HALF);
+
+    // Spectral flatness: geometric_mean / arithmetic_mean ∈ [0,1].
+    // Tonal content has low flatness; percussion / noise has high flatness.
+    let sumLog = 0, sumLin = 0, nBins = 0;
+    for (let b = 1; b < HALF; b++) {
+      if (mag[b] > 0) { sumLog += Math.log(mag[b]); sumLin += mag[b]; nBins++; }
+    }
+    const flatness    = nBins > 0 && sumLin > 0 ? Math.exp(sumLog / nBins) / (sumLin / nBins) : 1;
+    const tonalWeight = Math.max(0, 1 - 2 * flatness); // 0 = percussive, 1 = tonal
+
+    // Combined frame weight: tonal gate × RMS energy
+    const frameWeight = tonalWeight * frameRMS;
+    if (frameWeight === 0) continue;
+
+    // ── FFT chroma ────────────────────────────────────────────────────────────
+    const fc = new Float64Array(12);
+    for (let b = 1; b < HALF; b++) {
+      const pc  = binPc[b];  if (pc < 0) continue;
+      const oct = binOct[b];
+      const w = oct === 2 ? 2.0 : oct === 3 ? 1.8 : oct === 4 ? 1.4 : oct === 5 ? 1.0 : 0.6;
+      fc[pc] += (re[b] * re[b] + im[b] * im[b]) * w;
     }
 
-    chroma[pitchClass] = totalEnergy;
+    // ── HPCP ─────────────────────────────────────────────────────────────────
+    const hc = new Float64Array(12);
+    const thresh = maxMag * 0.05;
+    for (let b = 2; b < HALF - 1; b++) {
+      const freq = b * sampleRate / FRAME;
+      if (freq < 40 || freq > 4200) continue;
+      if (mag[b] <= thresh || mag[b] < mag[b - 1] || mag[b] < mag[b + 1]) continue;
+      const α = mag[b - 1], β = mag[b], γ = mag[b + 1];
+      const δ = 0.5 * (α - γ) / (α - 2 * β + γ + 1e-10);
+      const rMidi = 69 + 12 * Math.log2(freq * (1 + δ / b) / 440) - tuningOffset;
+      for (let h = 1; h <= N_HARM; h++) {
+        const hm = rMidi + 12 * Math.log2(h);
+        if (hm < 21 || hm > 108) continue;
+        const hw = (mag[b] * mag[b]) / (h * h);
+        const fp = ((hm % 12) + 12) % 12;
+        for (let pc = 0; pc < 12; pc++) {
+          let d = Math.abs(fp - pc);
+          if (d > 6) d = 12 - d;
+          hc[pc] += hw * Math.exp(-(d * d) / SIGMA2);
+        }
+      }
+    }
+
+    // Normalise this frame, then accumulate with combined weight
+    const fm = Math.max(...Array.from(fc));
+    const hm = Math.max(...Array.from(hc));
+    if (fm > 0) for (let i = 0; i < 12; i++) fftAcc[i]  += (fc[i] / fm) * frameWeight;
+    if (hm > 0) for (let i = 0; i < 12; i++) hpcpAcc[i] += (hc[i] / hm) * frameWeight;
+    weightSum += frameWeight;
   }
 
-  // Normalize chroma to [0, 1]
-  const maxChroma = Math.max(...Array.from(chroma));
-  if (maxChroma > 0) for (let i = 0; i < 12; i++) chroma[i] /= maxChroma;
+  if (weightSum === 0) return { fftChroma: Array(12).fill(1 / 12), hpcpChroma: Array(12).fill(1 / 12) };
 
-  const chromaArr = Array.from(chroma);
+  const fftChroma  = Array.from(fftAcc).map(v => v / weightSum);
+  const hpcpChroma = Array.from(hpcpAcc).map(v => v / weightSum);
+  const mF = Math.max(...fftChroma);  if (mF > 0) for (let i = 0; i < 12; i++) fftChroma[i]  /= mF;
+  const mH = Math.max(...hpcpChroma); if (mH > 0) for (let i = 0; i < 12; i++) hpcpChroma[i] /= mH;
+  return { fftChroma, hpcpChroma };
+}
 
-  // Score each of the 24 keys using the average of KS and Temperley correlations
-  // How much a modal profile must beat the best Major/Minor score to be reported.
-  // Keeps Major/Minor as the default for ambiguous tracks.
-  const MODAL_THRESHOLD = 0.12;
-
-  // ── Pass 1: find best Major / Minor across all roots ────────────────────────
-  let bestMajMinScore = -Infinity;
-  let bestMajMinKey   = 0;
-  let bestMajMinMode: ScaleMode = "Major";
-
+// ── Stage 5A/B: KS + Temperley profile correlation ───────────────────────────
+/**
+ * Score all 24 key candidates using Krumhansl–Schmuckler + Temperley profiles.
+ * Returns Float64Array[24]: indices 0–11 = Major keys, 12–23 = Minor keys.
+ */
+function ksTemperleyScores(chroma: number[]): Float64Array {
+  const scores = new Float64Array(24);
   for (let key = 0; key < 12; key++) {
-    const majorScore =
-      0.5 * pearsonCorrelation(chromaArr, rotateArray(KS_MAJOR, key)) +
-      0.5 * pearsonCorrelation(chromaArr, rotateArray(TEMP_MAJOR, key));
-    const minorScore =
-      0.5 * pearsonCorrelation(chromaArr, rotateArray(KS_MINOR, key)) +
-      0.5 * pearsonCorrelation(chromaArr, rotateArray(TEMP_MINOR, key));
+    scores[key]      = 0.5 * pearsonCorrelation(chroma, rotateArray(KS_MAJOR,   key))
+                     + 0.5 * pearsonCorrelation(chroma, rotateArray(TEMP_MAJOR, key));
+    scores[key + 12] = 0.5 * pearsonCorrelation(chroma, rotateArray(KS_MINOR,   key))
+                     + 0.5 * pearsonCorrelation(chroma, rotateArray(TEMP_MINOR, key));
+  }
+  return scores;
+}
 
-    if (majorScore > bestMajMinScore) { bestMajMinScore = majorScore; bestMajMinKey = key; bestMajMinMode = "Major"; }
-    if (minorScore > bestMajMinScore) { bestMajMinScore = minorScore; bestMajMinKey = key; bestMajMinMode = "Minor"; }
+// ── Stage 5C/D: Tonnetz tonal-centroid distance ───────────────────────────────
+/**
+ * Compute the 6-dimensional Tonnetz tonal centroid for a chroma vector.
+ * Following Harte et al. (2006) "Detecting Harmonic Change in Musical Audio".
+ *
+ * The three circle frequencies represent:
+ *   φ1 = cycle of fifths  (most musically salient)
+ *   φ2 = minor thirds
+ *   φ3 = major thirds
+ */
+function tonnetzCentroid(chroma: number[]): number[] {
+  const PHI1 = 2 * Math.PI * 7 / 12;   // perfect fifth
+  const PHI2 = 2 * Math.PI * 3 / 12;   // minor third
+  const PHI3 = 2 * Math.PI * 4 / 12;   // major third
+  const r = [1.0, 1.0, 0.5];           // Harte weights
+
+  let total = 0;
+  for (let p = 0; p < 12; p++) total += chroma[p];
+  if (total === 0) return [0, 0, 0, 0, 0, 0];
+
+  const T = [0, 0, 0, 0, 0, 0];
+  for (let p = 0; p < 12; p++) {
+    const c = chroma[p] / total;
+    T[0] += c * r[0] * Math.sin(p * PHI1);
+    T[1] += c * r[0] * Math.cos(p * PHI1);
+    T[2] += c * r[1] * Math.sin(p * PHI2);
+    T[3] += c * r[1] * Math.cos(p * PHI2);
+    T[4] += c * r[2] * Math.sin(p * PHI3);
+    T[5] += c * r[2] * Math.cos(p * PHI3);
+  }
+  return T;
+}
+
+// Cache of 24 theoretical key tonal centroids (computed once, reused).
+// Indices 0–11 = Major, 12–23 = Minor.
+let _tonnetzKeyCache: number[][] | null = null;
+
+function tonnetzKeyVectors(): number[][] {
+  if (_tonnetzKeyCache) return _tonnetzKeyCache;
+  const majorIntervals = [0, 2, 4, 5, 7, 9, 11];
+  const minorIntervals = [0, 2, 3, 5, 7, 8, 10];
+  _tonnetzKeyCache = [];
+  for (let root = 0; root < 12; root++) {
+    const chroma = new Array(12).fill(0);
+    for (const iv of majorIntervals) chroma[(root + iv) % 12] = 1;
+    _tonnetzKeyCache.push(tonnetzCentroid(chroma));
+  }
+  for (let root = 0; root < 12; root++) {
+    const chroma = new Array(12).fill(0);
+    for (const iv of minorIntervals) chroma[(root + iv) % 12] = 1;
+    _tonnetzKeyCache.push(tonnetzCentroid(chroma));
+  }
+  return _tonnetzKeyCache;
+}
+
+/**
+ * Score all 24 key candidates by Euclidean distance in Tonnetz space.
+ * Returns Float64Array[24] with higher = closer (better match).
+ */
+function tonnetzScores(chroma: number[]): Float64Array {
+  const keyVecs = tonnetzKeyVectors();
+  const audio   = tonnetzCentroid(chroma);
+  const scores  = new Float64Array(24);
+  for (let i = 0; i < 24; i++) {
+    let dist = 0;
+    for (let d = 0; d < 6; d++) {
+      const diff = audio[d] - keyVecs[i][d];
+      dist += diff * diff;
+    }
+    scores[i] = 1 / (1 + Math.sqrt(dist)); // higher = better
+  }
+  return scores;
+}
+
+// ── Stage 7: Circle-of-fifths smoothing ──────────────────────────────────────
+// Maps each pitch class to its position on the circle of fifths.
+// C=0, G=1, D=2, A=3, E=4, B=5, F#=6, Db=7, Ab=8, Eb=9, Bb=10, F=11
+const COF_POS = [0, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10, 5];
+
+/** Distance in CoF steps between two of the 24 keys (0–11 major, 12–23 minor). */
+function cofDist(i: number, j: number): number {
+  const iMaj = i < 12, jMaj = j < 12;
+  const iRoot = i % 12, jRoot = j % 12;
+  // For minor keys, project to relative-major CoF position
+  const iPos = iMaj ? COF_POS[iRoot] : COF_POS[(iRoot + 3) % 12];
+  const jPos = iMaj ? COF_POS[jRoot] : COF_POS[(jRoot + 3) % 12];
+  let d = Math.abs(iPos - jPos);
+  if (d > 6) d = 12 - d;
+  // Relative major/minor pairs share a CoF position; parallel pairs are 3 apart
+  if (iPos === jPos && iMaj !== jMaj) return 0.5; // relative pair
+  return d + (iMaj !== jMaj ? 0.5 : 0);           // cross-mode small penalty
+}
+
+/**
+ * Apply Gaussian smoothing in circle-of-fifths space.
+ * Stabilises temporal predictions: keys close on the CoF share probability mass.
+ * σ=1.0 — tight enough to preserve major/minor distinction.
+ */
+function cofSmoothing(scores: Float64Array): Float64Array {
+  const SIGMA2 = 1.0;
+  const out = new Float64Array(24);
+  for (let i = 0; i < 24; i++) {
+    let sum = 0, wSum = 0;
+    for (let j = 0; j < 24; j++) {
+      const w = Math.exp(-(cofDist(i, j) ** 2) / (2 * SIGMA2));
+      sum += scores[j] * w;
+      wSum += w;
+    }
+    out[i] = wSum > 0 ? sum / wSum : 0;
+  }
+  return out;
+}
+
+// ── Full pipeline ─────────────────────────────────────────────────────────────
+export function detectKey(audioBuffer: AudioBuffer): { key: string; keyIndex: number; mode: ScaleMode } {
+  const sampleRate  = audioBuffer.sampleRate;
+  const channelData = audioBuffer.getChannelData(0);
+
+  // ── Stage 1: Global tuning estimation ──────────────────────────────────────
+  // Use a 4096-sample window for tuning (smaller = faster, resolution still fine
+  // for 200–4000 Hz range: 44100/4096 ≈ 10.8 Hz/bin → ±0.06 semi error max).
+  const TUNE_FRAME  = 4096;
+  const tuningOffset = estimateTuning(channelData, sampleRate, TUNE_FRAME);
+
+  // ── Pre-allocate buffers for all window processing ──────────────────────────
+  const FRAME = sampleRate >= 32000 ? 16384 : 8192;
+  const HALF  = FRAME >> 1;
+
+  const hann = new Float64Array(FRAME);
+  for (let i = 0; i < FRAME; i++) hann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (FRAME - 1)));
+
+  // Tuning-corrected bin → pitch class / octave lookup
+  const binPc  = new Int8Array(HALF).fill(-1);
+  const binOct = new Int8Array(HALF).fill(-1);
+  for (let b = 1; b < HALF; b++) {
+    const freq = b * sampleRate / FRAME;
+    if (freq < 27.5 || freq > 4200) continue;
+    const midi = 69 + 12 * Math.log2(freq / 440) - tuningOffset;
+    binPc[b]  = ((Math.round(midi) % 12) + 12) % 12;
+    binOct[b] = Math.floor(midi / 12) - 1;
   }
 
-  // ── Pass 2: find best modal profile across all roots ────────────────────────
+  const prealloc = {
+    re: new Float64Array(FRAME), im: new Float64Array(FRAME),
+    mag: new Float32Array(HALF),
+    binPc, binOct, hann, FRAME,
+  };
+
+  // ── Stages 2–6: Single-pass energy+flatness-weighted chroma accumulation ────
+  // Build both chromagrams over up to 60 s centred on the track. Each FFT frame
+  // is weighted by (tonal_flatness_gate × frame_RMS) so that high-energy, tonal
+  // sections (drops, choruses) dominate the aggregate without requiring separate
+  // per-window voting — which previously caused Eb/Gb confusion.
+  const analysisDuration = Math.min(60, audioBuffer.duration);
+  const analysisStart    = Math.floor(((audioBuffer.duration - analysisDuration) / 2) * sampleRate);
+  const analysisEnd      = Math.min(analysisStart + Math.floor(analysisDuration * sampleRate), channelData.length);
+
+  const { fftChroma, hpcpChroma } = buildChromagrams(
+    channelData, sampleRate, analysisStart, analysisEnd, tuningOffset, prealloc
+  );
+
+  // ── Stage 5: Four-method ensemble ──────────────────────────────────────────
+  const methods: [Float64Array, number][] = [
+    [ksTemperleyScores(fftChroma),  0.30],
+    [ksTemperleyScores(hpcpChroma), 0.30],
+    [tonnetzScores(fftChroma),      0.20],
+    [tonnetzScores(hpcpChroma),     0.20],
+  ];
+  const aggregate = new Float64Array(24);
+  for (const [scores, weight] of methods) {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = 0; i < 24; i++) { if (scores[i] < lo) lo = scores[i]; if (scores[i] > hi) hi = scores[i]; }
+    const range = hi - lo || 1;
+    for (let i = 0; i < 24; i++) aggregate[i] += weight * (scores[i] - lo) / range;
+  }
+
+  // ── Stage 7: Circle-of-fifths smoothing ────────────────────────────────────
+  const smoothed = cofSmoothing(aggregate);
+
+  // ── Stage 8: Pick best Major / Minor, then modal check ─────────────────────
+  let bestMajMinScore = -Infinity, bestMajMinKey = 0;
+  let bestMajMinMode: ScaleMode = "Major";
+  for (let key = 0; key < 12; key++) {
+    if (smoothed[key]      > bestMajMinScore) { bestMajMinScore = smoothed[key];      bestMajMinKey = key; bestMajMinMode = "Major"; }
+    if (smoothed[key + 12] > bestMajMinScore) { bestMajMinScore = smoothed[key + 12]; bestMajMinKey = key; bestMajMinMode = "Minor"; }
+  }
+
+  // Modal check: upgrade to church mode only when evidence clearly exceeds Major/Minor.
+  // Use the energy-weighted fftChroma (already normalised) as the representative chroma.
+  const MODAL_THRESHOLD = 0.12;
   const modalProfiles: [number[], ScaleMode][] = [
     [DORIAN_PROFILE,         "Dorian"],
     [PHRYGIAN_PROFILE,       "Phrygian"],
@@ -349,48 +657,75 @@ export function detectKey(audioBuffer: AudioBuffer): { key: string; keyIndex: nu
     [HARMONIC_MINOR_PROFILE, "Harmonic Minor"],
     [MELODIC_MINOR_PROFILE,  "Melodic Minor"],
   ];
-
-  let bestModalScore = -Infinity;
-  let bestModalKey   = 0;
-  let bestModalMode: ScaleMode = "Dorian";
-
+  let bestModalScore = -Infinity, bestModalKey = 0, bestModalMode: ScaleMode = "Dorian";
   for (let key = 0; key < 12; key++) {
     for (const [profile, mode] of modalProfiles) {
-      const score = pearsonCorrelation(chromaArr, rotateArray(profile, key));
+      const score = pearsonCorrelation(fftChroma, rotateArray(profile, key));
       if (score > bestModalScore) { bestModalScore = score; bestModalKey = key; bestModalMode = mode; }
     }
   }
-
-  // Only report a modal result when it clearly outperforms Major/Minor.
   if (bestModalScore > bestMajMinScore + MODAL_THRESHOLD) {
     return { key: NOTE_NAMES[bestModalKey], keyIndex: bestModalKey, mode: bestModalMode };
   }
+
   return { key: NOTE_NAMES[bestMajMinKey], keyIndex: bestMajMinKey, mode: bestMajMinMode };
+}
+
+/**
+ * In-place radix-2 Cooley-Tukey FFT.
+ * re / im must be Float64Arrays of length 2^n.
+ */
+function fftInPlace(re: Float64Array, im: Float64Array): void {
+  const n = re.length;
+  let j = 0;
+  for (let i = 1; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const uRe = re[i + k], uIm = im[i + k];
+        const vRe = re[i + k + len / 2] * curRe - im[i + k + len / 2] * curIm;
+        const vIm = re[i + k + len / 2] * curIm + im[i + k + len / 2] * curRe;
+        re[i + k]           = uRe + vRe;  im[i + k]           = uIm + vIm;
+        re[i + k + len / 2] = uRe - vRe;  im[i + k + len / 2] = uIm - vIm;
+        const nr = curRe * wRe - curIm * wIm;
+        curIm = curRe * wIm + curIm * wRe;
+        curRe = nr;
+      }
+    }
+  }
 }
 
 function pearsonCorrelation(x: number[], y: number[]): number {
   const n = x.length;
   let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
-
   for (let i = 0; i < n; i++) {
-    sumX += x[i];
-    sumY += y[i];
+    sumX += x[i]; sumY += y[i];
     sumXY += x[i] * y[i];
     sumX2 += x[i] * x[i];
     sumY2 += y[i] * y[i];
   }
-
   const num = n * sumXY - sumX * sumY;
   const den = Math.sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
-
   return den === 0 ? 0 : num / den;
 }
 
+// Right-rotation: rotateArray(arr, k)[k] === arr[0]
+// Places the root weight (arr[0]) at pitch-class index k, so Pearson
+// correlation correctly rewards the profile root aligning with key k.
 function rotateArray(arr: number[], shift: number): number[] {
   const result = [...arr];
-  for (let i = 0; i < shift; i++) {
-    result.push(result.shift()!);
-  }
+  for (let i = 0; i < shift; i++) result.unshift(result.pop()!);
   return result;
 }
 
