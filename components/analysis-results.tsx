@@ -214,8 +214,38 @@ export function AnalysisResults({ analysis, stopRef }: AnalysisResultsProps) {
           <Row icon="♪"  label="key"      value={`${effectiveKey} ${effectiveMode}`}              accent />
           <Row icon="◷"  label="duration" value={formatDuration(analysis.trimmedDuration)} />
           <Row icon="✂"  label="trimmed"  value={silenceTrimmed > 0.01 ? `${silenceTrimmed.toFixed(2)}s` : "none"} />
+          <Row
+            icon="⊥"
+            label="dc offset"
+            value={analysis.dcCorrected ? `${(analysis.dcOffset * 100).toFixed(3)}%  fixed` : "none"}
+            accent={analysis.dcCorrected}
+          />
         </div>
       </div>
+
+      {/* silence trim callout */}
+      {silenceTrimmed > 0.01 && (
+        <div className="flex gap-2 text-[11px] text-muted-foreground border-l-2 border-primary/40 pl-3 py-0.5">
+          <span>
+            <span className="text-primary">✂</span>{" "}
+            <span className="text-foreground">{silenceTrimmed.toFixed(2)}s</span> of silence removed
+            from the start — daw export latency shifts your downbeat off-grid, causing tracks to
+            land late when dropped into a set or session. trimming keeps beat 1 locked to the bpm.
+          </span>
+        </div>
+      )}
+
+      {/* dc offset callout */}
+      {analysis.dcCorrected && (
+        <div className="flex gap-2 text-[11px] text-muted-foreground border-l-2 border-primary/40 pl-3 py-0.5">
+          <span>
+            <span className="text-primary">⊥</span> dc offset of{" "}
+            <span className="text-foreground">{(analysis.dcOffset * 100).toFixed(3)}%</span> detected
+            and removed — this invisible signal bias causes clicks, reduces headroom, and breaks
+            downstream compressors. most tools don&apos;t fix this.
+          </span>
+        </div>
+      )}
 
       {/* key toggle */}
       <div className="flex flex-col gap-2">

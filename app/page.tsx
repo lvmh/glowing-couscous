@@ -91,7 +91,8 @@ export default function Home() {
               <ul>
                 <li>Free BPM detector — find the tempo of any song instantly</li>
                 <li>Free key detection — detect major and minor keys with high accuracy</li>
-                <li>Silence trimming — remove dead air from the start and end of tracks</li>
+                <li>Silence trimming — removes DAW export latency from the start of tracks so beat 1 lands exactly on the grid when dropped into a DJ set or session</li>
+                <li>DC offset removal — automatically detects and corrects signal bias that causes clicks and reduces headroom. Most tools skip this entirely.</li>
                 <li>WAV export — download a properly named file ready for your DAW or DJ software</li>
                 <li>Works offline — no files are uploaded to any server</li>
               </ul>

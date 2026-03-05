@@ -24,6 +24,8 @@ export interface AudioAnalysis {
   duration: number;
   trimmedDuration: number;
   waveformData: number[];
+  dcOffset: number;       // max absolute DC offset found before correction (0–1 scale)
+  dcCorrected: boolean;   // whether correction was applied
 }
 
 /**
@@ -422,6 +424,58 @@ export function trimSilence(audioBuffer: AudioBuffer, thresholdDb: number = -50)
 }
 
 /**
+ * Remove DC offset from an AudioBuffer.
+ *
+ * DC offset is a constant bias in the waveform — the signal's average value
+ * is not zero. It's introduced by cheap audio interfaces, certain plugins, or
+ * DAW export paths, and causes:
+ *   • Clicks / pops at the start and end of the file
+ *   • Reduced effective headroom (the signal never centres at 0)
+ *   • Incorrect behaviour in downstream compressors and limiters
+ *
+ * Fix: compute the arithmetic mean (DC component) of each channel and subtract
+ * it from every sample. Only a new buffer is written when the offset exceeds
+ * a 0.01 % threshold — clean files pass through unchanged.
+ */
+export function removeDCOffset(
+  audioBuffer: AudioBuffer
+): { buffer: AudioBuffer; maxOffset: number; corrected: boolean } {
+  const numChannels = audioBuffer.numberOfChannels;
+  const length = audioBuffer.length;
+  const sampleRate = audioBuffer.sampleRate;
+
+  // Measure mean (DC component) per channel
+  let maxOffset = 0;
+  const means: number[] = [];
+  for (let ch = 0; ch < numChannels; ch++) {
+    const data = audioBuffer.getChannelData(ch);
+    let sum = 0;
+    for (let i = 0; i < length; i++) sum += data[i];
+    const mean = sum / length;
+    means.push(mean);
+    if (Math.abs(mean) > maxOffset) maxOffset = Math.abs(mean);
+  }
+
+  // Threshold: 0.0001 = 0.01 % of full scale — below this is inaudible
+  if (maxOffset < 0.0001) {
+    return { buffer: audioBuffer, maxOffset, corrected: false };
+  }
+
+  // Build a new buffer with the DC component subtracted
+  const offlineCtx = new OfflineAudioContext(numChannels, length, sampleRate);
+  const newBuffer = offlineCtx.createBuffer(numChannels, length, sampleRate);
+
+  for (let ch = 0; ch < numChannels; ch++) {
+    const src = audioBuffer.getChannelData(ch);
+    const dst = newBuffer.getChannelData(ch);
+    const mean = means[ch];
+    for (let i = 0; i < length; i++) dst[i] = src[i] - mean;
+  }
+
+  return { buffer: newBuffer, maxOffset, corrected: true };
+}
+
+/**
  * Generate waveform visualization data
  */
 export function getWaveformData(audioBuffer: AudioBuffer, numBars: number = 200): number[] {
@@ -537,13 +591,16 @@ export function generateOutputFilename(
 export async function analyzeAudio(file: File): Promise<AudioAnalysis> {
   const audioBuffer = await decodeAudioFile(file);
 
-  // Trim silence first — DAW exports often have leading (and trailing) latency.
-  // All downstream analysis runs on the trimmed buffer so that BPM bar-alignment
-  // uses the correct musical duration, not the padded one.
+  // 1. Trim silence — DAW exports often have leading (and trailing) latency.
   const trimmedBuffer = trimSilence(audioBuffer);
 
-  // Detect BPM on the trimmed audio so bar-alignment uses the right duration
-  const detectedBpm = detectBPM(trimmedBuffer);
+  // 2. Remove DC offset — must happen before BPM/key analysis and before export
+  //    so that the downloaded WAV is clean.
+  const { buffer: cleanBuffer, maxOffset: dcOffset, corrected: dcCorrected } =
+    removeDCOffset(trimmedBuffer);
+
+  // Detect BPM on the cleaned audio
+  const detectedBpm = detectBPM(cleanBuffer);
 
   // Try to read an explicit BPM from the filename (common for DAW / YouTube exports)
   const filenameBpm = extractBpmFromFilename(file.name);
@@ -554,18 +611,16 @@ export async function analyzeAudio(file: File): Promise<AudioAnalysis> {
   const bpmSource: "filename" | "detected" =
     filenameBpm != null ? "filename" : "detected";
 
-  // Detect key on trimmed audio
-  const { key, keyIndex, mode } = detectKey(trimmedBuffer);
+  // Detect key on clean audio
+  const { key, keyIndex, mode } = detectKey(cleanBuffer);
 
-  // Generate waveform
-  const waveformData = getWaveformData(trimmedBuffer);
+  // Generate waveform from clean audio
+  const waveformData = getWaveformData(cleanBuffer);
 
   const keyDisplay = `${key} ${mode}`;
 
   return {
     bpm,
-    // For labeled files we treat filename BPM as ground truth, so for display
-    // we align detectedBpm with the final BPM to avoid confusing mismatches.
     detectedBpm: bpm,
     filenameBpm,
     bpmSource,
@@ -574,10 +629,12 @@ export async function analyzeAudio(file: File): Promise<AudioAnalysis> {
     mode,
     keyDisplay,
     originalName: file.name,
-    trimmedBuffer,
+    trimmedBuffer: cleanBuffer,
     duration: audioBuffer.duration,
-    trimmedDuration: trimmedBuffer.duration,
+    trimmedDuration: cleanBuffer.duration,
     waveformData,
+    dcOffset,
+    dcCorrected,
   };
 }
 

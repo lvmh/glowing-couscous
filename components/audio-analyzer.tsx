@@ -28,8 +28,15 @@ export function AudioAnalyzer() {
     setError("");
     setFileName(file.name);
 
+    // Guarantee every step is visible for at least 0.3s.
+    // 5 steps × 300ms + small buffer = 2s minimum display time.
+    const MIN_MS = 2000;
+
     try {
-      const result = await analyzeAudio(file);
+      const [result] = await Promise.all([
+        analyzeAudio(file),
+        new Promise<void>((res) => setTimeout(res, MIN_MS)),
+      ]);
       setAnalysis(result);
       setState("done");
     } catch (err) {

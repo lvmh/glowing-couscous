@@ -57,7 +57,7 @@ export function WaveformDisplay({ data, playbackPosition, onClick }: WaveformDis
     const playedX = hasPlayhead ? Math.round(playbackPosition! * width) : 0;
 
     const drawBars = (alpha: number) => {
-      ctx.fillStyle = `rgba(0, 204, 136, ${alpha})`;
+      ctx.fillStyle = `rgba(107, 191, 35, ${alpha})`;
       for (let i = 0; i < data.length; i++) {
         const barHeight = data[i] * (height * 0.42);
         const x = i * barWidth;
