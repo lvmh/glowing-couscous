@@ -8,26 +8,7 @@ const KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.
 const TEMP_MAJOR = [5.0, 2.0, 3.5, 2.0, 4.5, 4.0, 2.0, 4.5, 2.0, 3.5, 1.5, 4.0];
 const TEMP_MINOR = [5.0, 2.0, 3.5, 4.5, 2.0, 4.0, 2.0, 4.5, 3.5, 2.0, 3.5, 1.5];
 
-// Mode profiles — 12 chroma weights relative to root (index 0).
-// Non-diatonic notes get 0.80; characteristic color tones are boosted
-// so adjacent modes can be distinguished when that degree is prominent.
-//   index: 0=root 1=b2 2=2 3=b3 4=3 5=4 6=#4/b5 7=5 8=b6 9=6 10=b7 11=7
-const DORIAN_PROFILE         = [6.35, 0.80, 3.00, 4.00, 0.80, 3.80, 0.80, 5.19, 0.80, 3.80, 3.40, 0.80];
-const PHRYGIAN_PROFILE       = [6.35, 3.20, 0.80, 4.00, 0.80, 3.80, 0.80, 5.19, 2.80, 0.80, 3.40, 0.80];
-const LYDIAN_PROFILE         = [6.35, 0.80, 3.00, 0.80, 4.38, 0.80, 3.50, 5.19, 0.80, 3.60, 0.80, 2.80];
-const MIXOLYDIAN_PROFILE     = [6.35, 0.80, 3.00, 0.80, 4.38, 3.80, 0.80, 5.19, 0.80, 3.60, 3.60, 0.80];
-const HARMONIC_MINOR_PROFILE = [6.35, 0.80, 3.00, 4.00, 0.80, 3.80, 0.80, 5.19, 2.80, 0.80, 0.80, 4.20];
-const MELODIC_MINOR_PROFILE  = [6.35, 0.80, 3.00, 4.00, 0.80, 3.80, 0.80, 5.19, 0.80, 3.60, 0.80, 3.20];
-
-export type ScaleMode =
-  | "Major"
-  | "Minor"
-  | "Dorian"
-  | "Phrygian"
-  | "Lydian"
-  | "Mixolydian"
-  | "Harmonic Minor"
-  | "Melodic Minor";
+export type ScaleMode = "Major" | "Minor";
 
 export const NOTE_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"];
 
@@ -644,28 +625,6 @@ export function detectKey(audioBuffer: AudioBuffer): { key: string; keyIndex: nu
   for (let key = 0; key < 12; key++) {
     if (smoothed[key]      > bestMajMinScore) { bestMajMinScore = smoothed[key];      bestMajMinKey = key; bestMajMinMode = "Major"; }
     if (smoothed[key + 12] > bestMajMinScore) { bestMajMinScore = smoothed[key + 12]; bestMajMinKey = key; bestMajMinMode = "Minor"; }
-  }
-
-  // Modal check: upgrade to church mode only when evidence clearly exceeds Major/Minor.
-  // Use the energy-weighted fftChroma (already normalised) as the representative chroma.
-  const MODAL_THRESHOLD = 0.12;
-  const modalProfiles: [number[], ScaleMode][] = [
-    [DORIAN_PROFILE,         "Dorian"],
-    [PHRYGIAN_PROFILE,       "Phrygian"],
-    [LYDIAN_PROFILE,         "Lydian"],
-    [MIXOLYDIAN_PROFILE,     "Mixolydian"],
-    [HARMONIC_MINOR_PROFILE, "Harmonic Minor"],
-    [MELODIC_MINOR_PROFILE,  "Melodic Minor"],
-  ];
-  let bestModalScore = -Infinity, bestModalKey = 0, bestModalMode: ScaleMode = "Dorian";
-  for (let key = 0; key < 12; key++) {
-    for (const [profile, mode] of modalProfiles) {
-      const score = pearsonCorrelation(fftChroma, rotateArray(profile, key));
-      if (score > bestModalScore) { bestModalScore = score; bestModalKey = key; bestModalMode = mode; }
-    }
-  }
-  if (bestModalScore > bestMajMinScore + MODAL_THRESHOLD) {
-    return { key: NOTE_NAMES[bestModalKey], keyIndex: bestModalKey, mode: bestModalMode };
   }
 
   return { key: NOTE_NAMES[bestMajMinKey], keyIndex: bestMajMinKey, mode: bestMajMinMode };
